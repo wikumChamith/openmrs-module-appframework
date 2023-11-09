@@ -13,7 +13,6 @@
  */
 package org.openmrs.module.appframework.service;
 
-import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -44,15 +43,8 @@ import org.openmrs.module.appframework.repository.AllFreeStandingExtensions;
 import org.openmrs.module.appframework.repository.AllUserApps;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.script.Bindings;
-import javax.script.ScriptContext;
-import javax.script.ScriptEngine;
-import javax.script.ScriptEngineManager;
-import javax.script.ScriptException;
-import javax.script.SimpleBindings;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -77,14 +69,14 @@ public class AppFrameworkServiceImpl extends BaseOpenmrsService implements AppFr
 
 	private AppFrameworkConfig appFrameworkConfig;
 
-	private ScriptEngine javascriptEngine;
-
 	private AllUserApps allUserApps;
+
+	private org.graalvm.polyglot.Context context;
 
 	public AppFrameworkServiceImpl(AllAppTemplates allAppTemplates, AllAppDescriptors allAppDescriptors,
 	    AllFreeStandingExtensions allFreeStandingExtensions, AllComponentsState allComponentsState,
 	    LocationService locationService, FeatureToggleProperties featureToggles, AppFrameworkConfig appFrameworkConfig,
-	    AllUserApps allUserApps) throws ScriptException {
+	    AllUserApps allUserApps) {
 		this.allAppTemplates = allAppTemplates;
 		this.allAppDescriptors = allAppDescriptors;
 		this.allFreeStandingExtensions = allFreeStandingExtensions;
@@ -92,36 +84,29 @@ public class AppFrameworkServiceImpl extends BaseOpenmrsService implements AppFr
 		this.locationService = locationService;
 		this.featureToggles = featureToggles;
 		this.appFrameworkConfig = appFrameworkConfig;
-		this.javascriptEngine = new ScriptEngineManager().getEngineByName("JavaScript");
 		this.allUserApps = allUserApps;
 
-		if (javascriptEngine == null) {
-			javascriptEngine = new ScriptEngineManager().getEngineByName("graal.js");
-			javascriptEngine.setBindings(javascriptEngine.createBindings(), ScriptContext.GLOBAL_SCOPE);
-		}
+		this.context = org.graalvm.polyglot.Context.newBuilder()
+				.allowAllAccess(true)
+				.allowExperimentalOptions(true).option("js.nashorn-compat", "true")
+				.build();
 
-		// there is surely a cleaner way to define this utility function in the global scope
-		this.javascriptEngine.eval("function hasMemberWithProperty(list, propName, val) { " + "if (!list) { return false; } "
+		this.context.eval("js","function hasMemberWithProperty(list, propName, val) { " + "if (!list) { return false; } "
 		        + "var i, len=list.length; " + "for (i=0; i<len; ++i) { "
 		        + "  if (list[i][propName] == val) { return true; } " + "} " + "return false; " + "}");
-		Object hasMemberWithProperty = javascriptEngine.getBindings(ScriptContext.ENGINE_SCOPE).get("hasMemberWithProperty");
-		javascriptEngine.getBindings(ScriptContext.GLOBAL_SCOPE).put("hasMemberWithProperty", hasMemberWithProperty);
 
-		this.javascriptEngine.eval("function some(list, func) { " + "if (!list) { return false; } "
+
+		this.context.eval("js","function some(list, func) { " + "if (!list) { return false; } "
                 + "var i, len=list.length; " + "for (i=0; i<len; ++i) { "
                 + "  if (func(list[i]) === true) { return true; } " + "} " + "return false; " + "}");
-        Object some = javascriptEngine.getBindings(ScriptContext.ENGINE_SCOPE).get("some");
-        javascriptEngine.getBindings(ScriptContext.GLOBAL_SCOPE).put("some", some);
 
-		this.javascriptEngine.eval("function fullMonthsBetweenDates(earlierDate, laterDate) { "
+		this.context.eval("js", "function fullMonthsBetweenDates(earlierDate, laterDate) { "
 				+ "var d1 = new Date(earlierDate); "
 				+ "var d2 = new Date(laterDate); "
 				+ "var monthsBetween = ((d2.getFullYear() - d1.getFullYear()) * 12) + (d2.getMonth() - d1.getMonth()); "
 				+ "if (d2.getDate() < d1.getDate()) { monthsBetween = monthsBetween - 1; } "
 				+ "return monthsBetween; "
 				+ "}");
-		Object fullMonthsBetweenDates = javascriptEngine.getBindings(ScriptContext.ENGINE_SCOPE).get("fullMonthsBetweenDates");
-		javascriptEngine.getBindings(ScriptContext.GLOBAL_SCOPE).put("fullMonthsBetweenDates", fullMonthsBetweenDates);
 	}
 
 	@Override
@@ -331,51 +316,11 @@ public class AppFrameworkServiceImpl extends BaseOpenmrsService implements AppFr
 	public boolean checkRequireExpression(Requireable candidate, AppContextModel contextModel) {
 		try {
 			String requireExpression = candidate.getRequire();
-			if (StringUtils.isBlank(requireExpression)) {
-				return true;
-			} else {
-				// If any properties in contextModel are Maps, we want to allow scripts to access their subproperties
-				// with dot notation, but ScriptEngine and Bindings don't naturally handle this. Instead we will convert
-				// all Map-type properties to JSON and use this to define objects directly within the ScriptEngine.
-				// (Properties that are not Maps don't need this special treatment.)
-				Bindings bindings = new SimpleBindings();
-				Map<String, Object> mapProperties = new HashMap<String, Object>();
-				for (Map.Entry<String, Object> e : contextModel.entrySet()) {
-					if (e.getValue() instanceof Map) {
-						mapProperties.put(e.getKey(), e.getValue());
-					} else {
-						bindings.put(e.getKey(), e.getValue());
-					}
-				}
-
-				javascriptEngine.setBindings(bindings, ScriptContext.ENGINE_SCOPE);
-				ObjectMapper jackson = new ObjectMapper();
-				for (Map.Entry<String, Object> e : mapProperties.entrySet()) {
-					try {
-						javascriptEngine.eval("var " + e.getKey() + " = " + jackson.writeValueAsString(e.getValue()) + ";");
-					}
-					catch (Exception ex) {
-						StringBuilder extraInfo = new StringBuilder();
-						extraInfo.append("type:").append(e.getValue().getClass().getName());
-						if (e.getValue() instanceof Map) {
-							Map<?, ?> map = (Map<?, ?>) e.getValue();
-							extraInfo.append(" properties:");
-							for (Map.Entry entry : map.entrySet()) {
-								extraInfo.append(" ").append(entry.getKey().toString()).append(":")
-										.append(entry.getValue() == null ? "null" : entry.getValue().getClass().toString());
-							}
-						}
-						log.error("Failed to set '" + e.getKey() + "' scope variable (" + extraInfo
-										+ ") while evaluating require check for " + candidate.getClass().getSimpleName()
-										.toLowerCase() + " " + candidate.getId(),
-								ex);
-						return false;
-					}
-				}
-
-				return javascriptEngine.eval("(" + requireExpression + ") == true").equals(Boolean.TRUE);
+			for (Map.Entry<String, Object> e : contextModel.entrySet()) {
+				String jsonValue = new ObjectMapper().writeValueAsString(e.getValue());
+				context.eval("js","var " + e.getKey() + " = " + jsonValue);
 			}
-
+			return context.eval("js","(" + requireExpression + ") == true").asBoolean();
 		}
 		catch (Exception e) {
 			log.error("Failed to evaluate 'require' check for extension " + candidate.getId(), e);
